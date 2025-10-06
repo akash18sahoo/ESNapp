@@ -1,194 +1,277 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.metrics import r2_score
+from numpy.linalg import eig
 import matplotlib.pyplot as plt
+from sklearn.metrics import r2_score
 from io import BytesIO
+import itertools
 
-st.title("🔵 ESN App – Stable Version with Ridge Regression")
+st.set_page_config(layout="wide")
+st.title("Echo State Network Predictor (ESNapp)")
 
-# ------------------------------
-# Utility functions
-# ------------------------------
+# -----------------------------
+# 1️⃣ Upload training file
+# -----------------------------
+file_uploader = st.file_uploader("Upload Training Data (Excel or CSV)", type=["xlsx", "csv"])
+model_trained = False
 
-def scale_data(train_df, test_df, input_cols, target_col):
-    """Scale inputs and target to [0,1] for ESN stability"""
-    train_scaled = train_df.copy()
-    test_scaled = test_df.copy()
-
-    # Scale input columns
-    for col in input_cols:
-        min_val, max_val = train_df[col].min(), train_df[col].max()
-        train_scaled[col] = (train_df[col] - min_val) / (max_val - min_val + 1e-8)
-        test_scaled[col] = (test_df[col] - min_val) / (max_val - min_val + 1e-8)
-
-    # Scale target
-    min_y, max_y = train_df[target_col].min(), train_df[target_col].max()
-    train_scaled[target_col] = (train_df[target_col] - min_y) / (max_y - min_y + 1e-8)
-
-    return train_scaled, test_scaled, (min_y, max_y)
-
-
-def inverse_scale(y_scaled, y_min, y_max):
-    return y_scaled * (y_max - y_min) + y_min
-
-
-def generate_reservoir(n_reservoir, spectral_radius, n_inputs):
-    """Generate random reservoir matrix and scale by spectral radius"""
-    W_in = (np.random.rand(n_reservoir, n_inputs + 1) - 0.5)  # +1 for bias
-    W = np.random.rand(n_reservoir, n_reservoir) - 0.5
-    # Scale to desired spectral radius
-    eigvals = np.linalg.eigvals(W)
-    W *= spectral_radius / (np.max(np.abs(eigvals)) + 1e-8)
-    return W_in, W
-
-
-def train_esn(X, y, n_reservoir, spectral_radius, ridge_alpha, washout):
-    """
-    Train ESN using ridge regression
-    X: input features (n_inputs x T)
-    y: target (1 x T)
-    """
-    n_inputs, T = X.shape
-    W_in, W = generate_reservoir(n_reservoir, spectral_radius, n_inputs)
-
-    # Collect reservoir states
-    states = np.zeros((n_reservoir, T))
-    x = np.zeros((n_reservoir, 1))
-    for t in range(T):
-        u = np.vstack([1, X[:, t:t+1]])  # add bias
-        x = np.tanh(W_in @ u + W @ x)
-        states[:, t] = x[:, 0]
-
-    # Apply washout
-    states_w = states[:, washout:]
-    y_w = y[washout:]
-
-    # Ridge regression: W_out = y * X^T * inv(X X^T + αI)
-    Xt = states_w.T
-    W_out = (y_w @ Xt) @ np.linalg.inv(Xt.T @ Xt + ridge_alpha * np.eye(n_reservoir))
-
-    return W_in, W, W_out, x[:, [0]]  # return final state as last_state
-
-
-def predict_esn(X, W_in, W, W_out, init_state, washout):
-    n_inputs, T = X.shape
-    x = init_state.copy()
-    y_pred = np.zeros(T)
-    for t in range(T):
-        u = np.vstack([1, X[:, t:t+1]])
-        x = np.tanh(W_in @ u + W @ x)
-        if t >= washout:
-            y_pred[t] = (W_out @ x)[0]
-    return y_pred
-
-
-# ------------------------------
-# UI – Data Upload
-# ------------------------------
-st.sidebar.header("📂 Data Upload")
-
-train_file = st.sidebar.file_uploader("Upload Training File (Excel)", type=['xlsx'])
-test_file = st.sidebar.file_uploader("Upload Testing File (Excel)", type=['xlsx'])
-
-if train_file:
-    train_df = pd.read_excel(train_file)
+if file_uploader:
+    # Handle both Excel and CSV files
+    file_type = file_uploader.name.split('.')[-1]
+    if file_type == 'csv':
+        train_df = pd.read_csv(file_uploader)
+    elif file_type == 'xlsx':
+        excel_sheets = pd.ExcelFile(file_uploader).sheet_names
+        selected_sheet = st.selectbox("Select the sheet for training data", excel_sheets)
+        train_df = pd.read_excel(file_uploader, sheet_name=selected_sheet)
+    
     st.subheader("Training Data Preview")
-    st.write(train_df.head())
+    st.dataframe(train_df.head())
 
-    input_cols_train = st.multiselect("Select input columns for training", train_df.columns.tolist())
-    target_col = st.selectbox("Select target column", train_df.columns.tolist())
+    input_cols_train = st.multiselect(
+        "Select input columns for training", 
+        train_df.columns.tolist(), 
+        default=train_df.columns[:-1].tolist()
+    )
+    output_cols_train = st.multiselect(
+        "Select output column(s) for training", 
+        train_df.columns.tolist(), 
+        default=[train_df.columns[-1]]
+    )
 
-    if test_file:
-        test_df = pd.read_excel(test_file)
-        st.subheader("Testing Data Preview")
-        st.write(test_df.head())
-        input_cols_test = st.multiselect("Select input columns for testing", test_df.columns.tolist(), default=input_cols_train)
+    # -----------------------------
+    # 2️⃣ ESN Hyperparameters
+    # -----------------------------
+    st.subheader("ESN Hyperparameters")
+    
+    # 2a️⃣ Optional Grid Search
+    grid_search = st.checkbox("Use Grid Search for best hyperparameters?")
+    if grid_search:
+        # User-defined ranges for grid search
+        n_reservoir_range = st.text_input("Enter n_reservoir values (e.g., 20,50,100)", "20, 50, 100")
+        spectral_radius_range = st.text_input("Enter spectral radius values (e.g., 0.7,0.9,1.1)", "0.7, 0.9, 1.1")
+        
+        try:
+            reservoir_options = [int(x.strip()) for x in n_reservoir_range.split(',')]
+            spectral_options = [float(x.strip()) for x in spectral_radius_range.split(',')]
+        except ValueError:
+            st.error("Invalid input. Please enter comma-separated numbers for the ranges.")
+            st.stop()
+        
+    else:
+        spectral_radius = st.slider("Spectral radius", 0.1, 2.0, 0.9, 0.05)
+        n_reservoir = st.slider("Reservoir size", 10, 500, 50, 10)
+    
+    seed = st.number_input("Random seed", value=0)
+    np.random.seed(seed)
 
-        # ------------------------------
-        # ESN Hyperparameters
-        # ------------------------------
-        st.sidebar.header("⚙️ ESN Hyperparameters")
-        use_grid = st.sidebar.checkbox("Use Grid Search", value=False)
+    # -----------------------------
+    # 3️⃣ Train ESN Button
+    # -----------------------------
+    if st.button("Train ESN Model"):
+        st.session_state['train_data'] = {
+            'X_train': train_df[input_cols_train].values,
+            'y_train': train_df[output_cols_train].values,
+            'input_cols': input_cols_train,
+            'output_cols': output_cols_train
+        }
 
-        if not use_grid:
-            n_reservoir = st.sidebar.slider("Reservoir Size", 100, 2000, 500, 50)
-            spectral_radius = st.sidebar.slider("Spectral Radius", 0.1, 2.0, 1.0, 0.1)
-            ridge_alpha = st.sidebar.number_input("Ridge Regularization (α)", value=1e-6, format="%.1e")
-            washout = st.sidebar.slider("Washout Steps", 0, 200, 50, 5)
-        else:
-            n_reservoir_list = st.sidebar.text_input("Reservoir Sizes (comma separated)", "200,500,800")
-            spectral_list = st.sidebar.text_input("Spectral Radii (comma separated)", "0.5,0.8,1.0,1.2")
-            ridge_list = st.sidebar.text_input("Ridge α (comma separated)", "1e-6,1e-5,1e-4")
-            washout = st.sidebar.slider("Washout Steps", 0, 200, 50, 5)
+        # Normalize
+        X_train = st.session_state['train_data']['X_train']
+        y_train = st.session_state['train_data']['y_train']
 
-            n_reservoir_list = [int(x.strip()) for x in n_reservoir_list.split(",")]
-            spectral_list = [float(x.strip()) for x in spectral_list.split(",")]
-            ridge_list = [float(x.strip()) for x in ridge_list.split(",")]
+        input_mean = X_train.mean(axis=0)
+        input_std  = X_train.std(axis=0)
+        X_train_norm = (X_train - input_mean) / input_std
+        
+        output_mean = y_train.mean(axis=0)
+        output_std  = y_train.std(axis=0)
+        y_train_norm = (y_train - output_mean) / output_std
+        
+        # Transpose
+        X_train_norm = X_train_norm.T
+        y_train_norm = y_train_norm.T
+        n_inputs = X_train_norm.shape[0]
 
-        # ------------------------------
-        # Train button
-        # ------------------------------
-        if st.button("🚀 Train ESN"):
-            # Scale data
-            train_scaled, test_scaled, (y_min, y_max) = scale_data(train_df, test_df, input_cols_train, target_col)
+        # -----------------------------
+        # Function to train and evaluate ESN (now includes R2 score)
+        # -----------------------------
+        @st.cache_data
+        def train_and_evaluate_esn(n_res, sr, input_norm, output_norm, n_in, output_std, output_mean):
+            np.random.seed(seed)
+            Win = (np.random.rand(n_res, n_in) * 2 - 1) * 0.1
+            W = np.random.rand(n_res, n_res) * 2 - 1
+            W = W * (sr / max(abs(eig(W)[0])))
+            
+            x = np.zeros((n_res, 1))
+            X_res = []
+            for t in range(input_norm.shape[1]):
+                u = input_norm[:, t].reshape(-1, 1)
+                x = np.tanh(Win @ u + W @ x)
+                X_res.append(x)
+            
+            X_res = np.hstack(X_res)
+            
+            # Use pseudo-inverse for robust linear regression
+            Wout = output_norm @ X_res.T @ np.linalg.pinv(X_res @ X_res.T)
 
-            X_train = train_scaled[input_cols_train].to_numpy().T
-            y_train = train_scaled[target_col].to_numpy()
+            # Check R-squared on training data
+            y_pred_norm_train = Wout @ X_res
+            y_pred_train = y_pred_norm_train * output_std + output_mean
+            
+            # Flatten to handle multi-output correctly
+            r2 = r2_score(y_train.flatten(), y_pred_train.T.flatten())
+            
+            return Win, W, Wout, r2
 
-            X_test = test_scaled[input_cols_test].to_numpy().T
-            y_test_actual = test_df[target_col].to_numpy()
-
-            if not use_grid:
-                W_in, W, W_out, last_state = train_esn(X_train, y_train, n_reservoir, spectral_radius, ridge_alpha, washout)
-                y_pred_scaled = predict_esn(X_test, W_in, W, W_out, last_state, washout)
-                y_pred = inverse_scale(y_pred_scaled, y_min, y_max)
-
-                # R2
-                r2 = r2_score(y_test_actual[washout:], y_pred[washout:])
-                st.success(f"✅ R² Score: {r2:.4f}")
-
+        # -----------------------------
+        # Grid Search
+        # -----------------------------
+        if grid_search:
+            st.info("Performing grid search... This may take time for large reservoirs.")
+            best_r2 = -np.inf
+            best_params = {}
+            
+            for n_res_try, sr_try in itertools.product(reservoir_options, spectral_options):
+                Win_try, W_try, Wout_try, r2 = train_and_evaluate_esn(
+                    n_res_try, sr_try, X_train_norm, y_train_norm, n_inputs, output_std, output_mean
+                )
+                
+                if r2 > best_r2:
+                    best_r2 = r2
+                    best_params = {
+                        'n_reservoir': n_res_try,
+                        'spectral_radius': sr_try,
+                        'Win': Win_try,
+                        'W': W_try,
+                        'Wout': Wout_try
+                    }
+                    
+            if best_r2 <= 0:
+                st.warning(f"Could not find a positive R-squared score. Best R²: {best_r2:.4f}")
+                st.info("Try adjusting the ranges for your grid search.")
             else:
-                best_r2 = -np.inf
-                best_params = None
-                best_pred = None
-                for nr in n_reservoir_list:
-                    for sr in spectral_list:
-                        for ra in ridge_list:
-                            W_in, W, W_out, last_state = train_esn(X_train, y_train, nr, sr, ra, washout)
-                            y_pred_scaled = predict_esn(X_test, W_in, W, W_out, last_state, washout)
-                            y_pred = inverse_scale(y_pred_scaled, y_min, y_max)
-                            r2 = r2_score(y_test_actual[washout:], y_pred[washout:])
-                            if r2 > best_r2:
-                                best_r2 = r2
-                                best_params = (nr, sr, ra)
-                                best_pred = y_pred
-                st.success(f"🏆 Best R² = {best_r2:.4f} with params Reservoir={best_params[0]}, Spectral={best_params[1]}, Ridge={best_params[2]}")
-                y_pred = best_pred
-
-            # ------------------------------
-            # Plotting
-            # ------------------------------
-            fig, ax = plt.subplots(figsize=(8,4))
-            ax.plot(y_test_actual, label="Actual")
-            ax.plot(y_pred, label="Predicted", linestyle="--")
-            ax.set_title("Predicted vs Actual")
-            ax.legend()
-            st.pyplot(fig)
-
-            # ------------------------------
-            # Download predictions
-            # ------------------------------
-            pred_df = pd.DataFrame({
-                "Actual": y_test_actual,
-                "Predicted": y_pred
-            })
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                pred_df.to_excel(writer, index=False, sheet_name="Predictions")
-            st.download_button(
-                label="📥 Download Predictions",
-                data=output.getvalue(),
-                file_name="predictions.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                st.success(f"Best grid search R²: {best_r2:.4f} | n_reservoir: {best_params['n_reservoir']}, spectral_radius: {best_params['spectral_radius']}")
+            
+            Win, W, Wout = best_params['Win'], best_params['W'], best_params['Wout']
+            n_reservoir = best_params['n_reservoir']
+            
+        else:
+            Win, W, Wout, r2_train = train_and_evaluate_esn(
+                n_reservoir, spectral_radius, X_train_norm, y_train_norm, n_inputs, output_std, output_mean
             )
+            if r2_train <= 0:
+                st.warning(f"The R² score is {r2_train:.4f}. This indicates a poor model fit.")
+                st.info("You may want to try the grid search option to find better hyperparameters.")
+            else:
+                st.success(f"✅ ESN Model Trained Successfully! R² on training data: {r2_train:.4f}")
+
+        # Store model in session
+        st.session_state['trained_model'] = {
+            'Win': Win,
+            'W': W,
+            'Wout': Wout,
+            'n_reservoir': n_reservoir,
+            'input_mean': input_mean,
+            'input_std': input_std,
+            'output_mean': output_mean,
+            'output_std': output_std,
+            'input_cols': input_cols_train,
+            'output_cols': output_cols_train,
+        }
+        
+# -----------------------------
+# 4️⃣ Upload Test File
+# -----------------------------
+test_file = st.file_uploader("Upload Test Data (Excel or CSV)", type=["xlsx", "csv"], key="test_uploader")
+
+if test_file and 'trained_model' in st.session_state:
+    file_type_test = test_file.name.split('.')[-1]
+    
+    if file_type_test == 'csv':
+        test_df = pd.read_csv(test_file)
+    elif file_type_test == 'xlsx':
+        excel_sheets_test = pd.ExcelFile(test_file).sheet_names
+        selected_sheet_test = st.selectbox("Select the sheet for test data", excel_sheets_test)
+        test_df = pd.read_excel(test_file, sheet_name=selected_sheet_test)
+
+    st.subheader("Test Data Preview")
+    st.dataframe(test_df.head())
+
+    input_cols_test = st.multiselect(
+        "Select input columns for testing", 
+        test_df.columns.tolist(), 
+        default=st.session_state['trained_model']['input_cols']
+    )
+
+    if st.button("Predict on Test File"):
+        model = st.session_state['trained_model']
+        
+        # Check if selected input columns match training input columns
+        if set(input_cols_test) != set(model['input_cols']):
+            st.error("Selected test input columns must match the training input columns.")
+            st.stop()
+
+        X_test = test_df[input_cols_test].values
+        X_test_norm = (X_test - model['input_mean']) / model['input_std']
+        X_test_norm = X_test_norm.T
+
+        # Predict
+        x = np.zeros((model['n_reservoir'], 1))
+        X_test_res = []
+        for t in range(X_test_norm.shape[1]):
+            u = X_test_norm[:, t].reshape(-1, 1)
+            x = np.tanh(model['Win'] @ u + model['W'] @ x)
+            X_test_res.append(x)
+        
+        X_test_res = np.hstack(X_test_res)
+        y_pred_norm = (model['Wout'] @ X_test_res).T
+        y_pred = y_pred_norm * model['output_std'] + model['output_mean']
+
+        # -----------------------------
+        # Show results
+        # -----------------------------
+        st.subheader("Predicted Output")
+        pred_df = pd.DataFrame(y_pred, columns=model['output_cols'])
+        st.dataframe(pred_df)
+
+        # -----------------------------
+        # Plot predicted vs actual if available
+        # -----------------------------
+        has_actual_output = any(col in test_df.columns for col in model['output_cols'])
+        if has_actual_output:
+            y_actual = test_df[model['output_cols']].values
+            R2_test = r2_score(y_actual, y_pred)
+            st.write(f"R² score on test data: {R2_test:.4f}")
+
+            st.subheader("Predicted vs Actual")
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.plot(y_actual, 'b', label="Actual", linewidth=2)
+            ax.plot(y_pred, 'r--', label="Predicted", linewidth=2)
+            ax.set_xlabel("Sample")
+            ax.set_ylabel("Output")
+            ax.set_title("ESN Prediction on Test Set")
+            ax.legend()
+            ax.grid(True)
+            st.pyplot(fig)
+        else:
+            st.subheader("Predicted Values")
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.plot(y_pred, 'r--', label="Predicted", linewidth=2)
+            ax.set_xlabel("Sample")
+            ax.set_ylabel("Output")
+            ax.set_title("ESN Prediction")
+            ax.legend()
+            ax.grid(True)
+            st.pyplot(fig)
+        
+        # Download predictions
+        output = BytesIO()
+        pred_df.to_excel(output, index=False, engine='openpyxl')
+        st.download_button(
+            label="Download Predictions as Excel",
+            data=output.getvalue(),
+            file_name="ESN_predictions.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )

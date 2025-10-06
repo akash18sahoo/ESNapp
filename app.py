@@ -49,8 +49,8 @@ if file_uploader:
     grid_search = st.checkbox("Use Grid Search for best hyperparameters?")
     if grid_search:
         # User-defined ranges for grid search
-        n_reservoir_range = st.text_input("Enter n_reservoir values (e.g., 20,50,100)", "20, 50, 100")
-        spectral_radius_range = st.text_input("Enter spectral radius values (e.g., 0.7,0.9,1.1)", "0.7, 0.9, 1.1")
+        n_reservoir_range = st.text_input("Enter n_reservoir values (e.g., 20,50,100)", "20, 50, 100,200,300,400,500")
+        spectral_radius_range = st.text_input("Enter spectral radius values (e.g., 0.7,0.9,1.1)", "0.7, 0.9, 1.1,1.15,1.2,1.3,1.5")
         
         try:
             reservoir_options = [int(x.strip()) for x in n_reservoir_range.split(',')]

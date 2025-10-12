@@ -199,11 +199,21 @@ if test_file and 'trained_model' in st.session_state:
     st.subheader("Test Data Preview")
     st.dataframe(test_df.head())
 
+    # --- FIX: ensure the default contains only columns that actually exist in test_df
+    trained_input_cols = st.session_state['trained_model'].get('input_cols', [])
+    available_cols = test_df.columns.tolist()
+    # intersection preserves order of trained_input_cols but only keeps those present in available_cols
+    default_for_test = [c for c in trained_input_cols if c in available_cols]
+
     input_cols_test = st.multiselect(
         "Select input columns for testing", 
-        test_df.columns.tolist(), 
-        default=st.session_state['trained_model']['input_cols']
+        available_cols, 
+        default=default_for_test
     )
+
+    if not input_cols_test:
+        st.warning("Please select at least one input column for testing.")
+        st.stop()
 
     if st.button("Predict on Test File"):
         model = st.session_state['trained_model']

@@ -12,11 +12,18 @@ st.title("Echo State Network Predictor (ESNapp)")
 # -----------------------------
 # 1️⃣ Upload training file
 # -----------------------------
-train_file = st.file_uploader("Upload Training Excel (Inputs + Outputs)", type=["xlsx"])
+train_file = st.file_uploader("Upload Training Data (Excel or CSV)", type=["xlsx", "csv"])
 model_trained = False
 
 if train_file:
-    train_df = pd.read_excel(train_file)
+    file_type = train_file.name.split('.')[-1].lower()
+    if file_type == 'csv':
+        train_df = pd.read_csv(train_file)
+    else:
+        excel_sheets = pd.ExcelFile(train_file).sheet_names
+        selected_sheet = st.selectbox("Select sheet for training data", excel_sheets)
+        train_df = pd.read_excel(train_file, sheet_name=selected_sheet)
+
     st.subheader("Training Data Preview")
     st.dataframe(train_df.head())
 
@@ -134,10 +141,17 @@ if train_file:
 # -----------------------------
 # 4️⃣ Upload Test File
 # -----------------------------
-test_file  = st.file_uploader("Upload Test Excel (Inputs only or with actual outputs)", type=["xlsx"], key="test_uploader")
+test_file  = st.file_uploader("Upload Test Data (Excel or CSV)", type=["xlsx", "csv"], key="test_uploader")
 
 if test_file and 'trained_model' in st.session_state:
-    test_df = pd.read_excel(test_file)
+    file_type_test = test_file.name.split('.')[-1].lower()
+    if file_type_test == 'csv':
+        test_df = pd.read_csv(test_file)
+    else:
+        excel_sheets_test = pd.ExcelFile(test_file).sheet_names
+        selected_sheet_test = st.selectbox("Select sheet for test data", excel_sheets_test)
+        test_df = pd.read_excel(test_file, sheet_name=selected_sheet_test)
+
     st.subheader("Test Data Preview")
     st.dataframe(test_df.head())
 
@@ -207,6 +221,3 @@ if test_file and 'trained_model' in st.session_state:
             file_name="ESN_predictions.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
-
-
